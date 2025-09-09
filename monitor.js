@@ -6,15 +6,15 @@ import puppeteer from 'puppeteer-core';
 import express from 'express';
 
 /**
- * Variables à mettre sur Render → Environment:
+ * Variables d’environnement (Render → Environment → Add):
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
- * DISCORD_WEBHOOK=... (ton webhook)
+ * DISCORD_WEBHOOK=https://discord.com/api/webhooks/xxx/yyy
  * SCAN_EVERY_MS=1500
  * RELOAD_EVERY_MS=15000
  * OPEN_CONFIRM_SCANS=1
  * CLOSE_CONFIRM_SCANS=3
  * STATE_FILE=state.json
- * PORT=10000   (Render injectera la sienne dans $PORT)
+ * PORT=10000   (Render fournit sa propre valeur dans $PORT)
  */
 
 const {
@@ -98,8 +98,12 @@ let browser, page, lastReload = 0, lastScanAt = 0;
 async function ensureBrowser() {
   if (browser && page) return;
 
-  // Render/puppeteer-core: Chrome installé via @puppeteer/browsers → chemin exposé
-  const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome';
+  // 👉 Render installe Chrome via @puppeteer/browsers et expose le chemin dans PUPPETEER_EXECUTABLE_PATH
+  const exePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (!exePath) {
+    console.error('❌ PUPPETEER_EXECUTABLE_PATH manquant (build Chrome non effectué).');
+    process.exit(1);
+  }
 
   browser = await puppeteer.launch({
     headless: 'new',
@@ -127,7 +131,7 @@ async function scanCycle() {
   try {
     await ensureBrowser();
 
-    // reload périodique
+    // Reload périodique (si l’UI ne pousse pas les updates)
     if (Date.now() - lastReload >= parseInt(RELOAD_EVERY_MS, 10)) {
       await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
       lastReload = Date.now();
@@ -137,7 +141,7 @@ async function scanCycle() {
     lastScanAt = Date.now();
     const visible = new Set(items.map(o => o.id));
 
-    // maj visibles
+    // Mettre à jour l'état pour chaque ligne visible
     for (const d of items) {
       if (!state[d.id]) {
         state[d.id] = {
@@ -157,7 +161,7 @@ async function scanCycle() {
       }
     }
 
-    // ouvertures
+    // ✅ Ouvertures
     for (const [id, st] of Object.entries(state)) {
       if (!st.openedNotified && (st.seen || 0) >= OPEN_N) {
         const arrow = sideEmoji(st.side);
@@ -175,7 +179,7 @@ async function scanCycle() {
       }
     }
 
-    // fermetures (disparition)
+    // ✅ Fermetures (disparition)
     for (const [id, st] of Object.entries(state)) {
       if (visible.has(id)) continue;
 
@@ -196,6 +200,7 @@ async function scanCycle() {
           st.closedNotified = true;
         }
       } else if ((st.seen || 0) < OPEN_N) {
+        // jamais confirmé → purge
         st.missing = (st.missing || 0) + 1;
         if (st.missing >= 2) delete state[id];
       }
