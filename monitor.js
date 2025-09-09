@@ -2,19 +2,19 @@
 import 'dotenv/config';
 import fs from 'fs';
 import fetch from 'node-fetch';
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import express from 'express';
 
 /**
- * Variables d’environnement à définir sur Render :
+ * Variables à mettre sur Render → Environment:
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
- * DISCORD_WEBHOOK=... (ton webhook Discord)
+ * DISCORD_WEBHOOK=... (ton webhook)
  * SCAN_EVERY_MS=1500
  * RELOAD_EVERY_MS=15000
  * OPEN_CONFIRM_SCANS=1
  * CLOSE_CONFIRM_SCANS=3
  * STATE_FILE=state.json
- * PORT=10000   (Render injectera sa propre valeur dans $PORT)
+ * PORT=10000   (Render injectera la sienne dans $PORT)
  */
 
 const {
@@ -41,6 +41,7 @@ function loadState() {
 function saveState(s) {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {}
 }
+// state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
 let state = loadState();
 
 // ---------- Utils ----------
@@ -88,7 +89,7 @@ async function parseVisibleOrders(page) {
   }, SEL);
 }
 
-// ---------- Puppeteer Loop ----------
+// ---------- Puppeteer loop ----------
 const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS, 10);
 const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS, 10);
 
@@ -97,9 +98,8 @@ let browser, page, lastReload = 0, lastScanAt = 0;
 async function ensureBrowser() {
   if (browser && page) return;
 
-  const exePath =
-    process.env.PUPPETEER_EXECUTABLE_PATH ||
-    (puppeteer.executablePath ? puppeteer.executablePath() : undefined);
+  // Render/puppeteer-core: Chrome installé via @puppeteer/browsers → chemin exposé
+  const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome';
 
   browser = await puppeteer.launch({
     headless: 'new',
@@ -127,6 +127,7 @@ async function scanCycle() {
   try {
     await ensureBrowser();
 
+    // reload périodique
     if (Date.now() - lastReload >= parseInt(RELOAD_EVERY_MS, 10)) {
       await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
       lastReload = Date.now();
@@ -136,7 +137,7 @@ async function scanCycle() {
     lastScanAt = Date.now();
     const visible = new Set(items.map(o => o.id));
 
-    // update visibles
+    // maj visibles
     for (const d of items) {
       if (!state[d.id]) {
         state[d.id] = {
@@ -156,7 +157,7 @@ async function scanCycle() {
       }
     }
 
-    // OUVERTURES
+    // ouvertures
     for (const [id, st] of Object.entries(state)) {
       if (!st.openedNotified && (st.seen || 0) >= OPEN_N) {
         const arrow = sideEmoji(st.side);
@@ -174,9 +175,10 @@ async function scanCycle() {
       }
     }
 
-    // FERMETURES
+    // fermetures (disparition)
     for (const [id, st] of Object.entries(state)) {
       if (visible.has(id)) continue;
+
       if (!st.closedNotified && (st.seen || 0) >= OPEN_N) {
         st.missing = (st.missing || 0) + 1;
         if (st.missing >= CLOSE_N) {
@@ -205,7 +207,7 @@ async function scanCycle() {
   }
 }
 
-// ---------- HTTP server (keep-alive + tools) ----------
+// ---------- HTTP (keep-alive + outils) ----------
 const app = express();
 app.get('/', (_, res) => res.send('OK'));
 app.get('/health', (_, res) => {
@@ -234,5 +236,5 @@ app.listen(parseInt(PORT, 10), () => {
   console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`);
 });
 
-// ---------- Launch loop ----------
+// ---------- Loop ----------
 setInterval(scanCycle, parseInt(SCAN_EVERY_MS, 10));
