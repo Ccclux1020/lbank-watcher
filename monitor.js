@@ -1,4 +1,4 @@
-// monitor.js — Puppeteer prestart + fallback automatique vers le cache Render
+// monitor.js — Render-ready: Chrome téléchargé au prestart, lancement robuste + alertes Discord
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -6,7 +6,7 @@ import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import express from 'express';
 
-/** Env (Render → Environment) :
+/** Variables d'env à définir sur Render (Environment) :
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
  * DISCORD_WEBHOOK=<ton webhook Discord>
  * SCAN_EVERY_MS=1500
@@ -36,13 +36,14 @@ if (!TRADER_URL || !DISCORD_WEBHOOK) {
 // --------- State ----------
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s){ try { fs.writeFileSync(STATE_FILE, JSON.stringify(s,null,2)); } catch {} }
+// state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
 let state = loadState();
 
 // --------- Utils ----------
 const sideEmoji = (side)=> /long/i.test(side) ? '🟢⬆️' : (/short/i.test(side) ? '🔴⬇️' : 'ℹ️');
 async function notifyDiscord(content){
   try { await fetch(DISCORD_WEBHOOK,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})}); }
-  catch(e){ console.error('Discord error:', e); }
+  catch(e){ console.error('Discord error:', e.message); }
 }
 
 // --------- Sélecteurs (selon ton HTML) ----------
@@ -92,12 +93,10 @@ function findChromeInCache() {
 }
 
 function getExecutablePath() {
-  // 1) ce que donne Puppeteer (si Chromium a été trouvé/configuré)
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
   } catch {}
-  // 2) sinon on scanne le cache Render
   const c = findChromeInCache();
   if (c && fs.existsSync(c)) return c;
   return null;
@@ -109,35 +108,89 @@ const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS,10);
 
 let browser, page, lastReload=0, lastScanAt=0;
 
-async function ensureBrowser(){
+async function ensureBrowser() {
   if (browser && page) return;
 
   const exePath = getExecutablePath();
   if (!exePath) {
-    console.error('❌ Aucun binaire Chrome/Chromium trouvé (ni via Puppeteer, ni dans /opt/render/.cache/puppeteer).');
-    console.error('➡️ Vérifie que le prestart a bien tourné et que les logs montrent un download Chrome.');
+    console.error('❌ Aucun binaire Chrome/Chromium trouvé. Le prestart doit télécharger Chrome.');
     return;
   }
   console.log('➡️ Using browser at:', exePath);
 
-  browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: exePath,
-    args: [
-      '--no-sandbox','--disable-setuid-sandbox',
-      '--disable-dev-shm-usage','--disable-gpu',
-      '--lang=fr-FR,fr'
-    ]
-  });
+  const baseArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-breakpad',
+    '--disable-component-update',
+    '--disable-domain-reliability',
+    '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+    '--disable-hang-monitor',
+    '--disable-ipc-flooding-protection',
+    '--disable-renderer-backgrounding',
+    '--force-color-profile=srgb',
+    '--metrics-recording-only',
+    '--mute-audio',
+    '--no-pings',
+    '--single-process',
+    '--no-zygote'
+  ];
+
+  // Essai 1
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      executablePath: exePath,
+      args: baseArgs,
+      protocolTimeout: 60000,
+      timeout: 60000
+    });
+  } catch (e) {
+    console.error('⚠️  1er lancement échoué :', e.message);
+    // Essai 2
+    try {
+      browser = await puppeteer.launch({
+        headless: true,
+        executablePath: exePath,
+        args: baseArgs.concat(['--remote-debugging-port=0']),
+        protocolTimeout: 90000,
+        timeout: 90000
+      });
+    } catch (e2) {
+      console.error('❌ 2e lancement échoué :', e2.message);
+      return;
+    }
+  }
 
   page = await browser.newPage();
-  await page.setViewport({ width:1366, height:768 });
+
+  // Économie de ressources
+  try {
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const r = req.resourceType();
+      if (r === 'image' || r === 'media' || r === 'font') req.abort();
+      else req.continue();
+    });
+  } catch {}
+
+  await page.setViewport({ width: 1200, height: 800 });
   await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36');
 
   console.log('🌐 Ouverture', TRADER_URL);
-  await page.goto(TRADER_URL, { waitUntil:'networkidle2', timeout:60000 });
-  lastReload = Date.now();
-  await notifyDiscord('🟢 LBank headless watcher démarré (keep-alive + reload périodique).');
+  try {
+    await page.goto(TRADER_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    lastReload = Date.now();
+    await notifyDiscord('🟢 LBank headless watcher démarré (keep-alive + reload périodique).');
+  } catch (e) {
+    console.error('❌ page.goto error:', e.message);
+  }
 }
 
 async function scanCycle(){
@@ -154,6 +207,7 @@ async function scanCycle(){
     lastScanAt = Date.now();
     const visible = new Set(items.map(o=>o.id));
 
+    // Enregistre/actualise les lignes visibles
     for(const d of items){
       if(!state[d.id]){
         state[d.id]={seen:1,missing:0,openedNotified:false,closedNotified:false,
@@ -181,10 +235,9 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
       }
     }
 
-    // Fermetures
+    // Fermetures (disparition)
     for(const [id,st] of Object.entries(state)){
       if (visible.has(id)) continue;
-
       if(!st.closedNotified && (st.seen||0) >= OPEN_N){
         st.missing=(st.missing||0)+1;
         if (st.missing >= CLOSE_N){
