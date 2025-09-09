@@ -1,8 +1,9 @@
 {
   "name": "lbank-discord-watcher",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
+    "prestart": "npx puppeteer browsers install chrome@stable --path=/opt/render/.cache/puppeteer",
     "start": "node monitor.js"
   },
   "dependencies": {
@@ -10,8 +11,5 @@
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
     "puppeteer": "^22.15.0"
-  },
-  "puppeteer": {
-    "skip_chromium_download": false
   }
 }
