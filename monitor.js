@@ -1,11 +1,11 @@
-// monitor.js — version simple & robuste (Puppeteer télécharge son Chromium)
+// monitor.js — Puppeteer télécharge Chrome au démarrage (prestart), on utilise son executablePath
 import 'dotenv/config';
 import fs from 'fs';
 import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import express from 'express';
 
-/** Env (Render → Environment) :
+/** Variables d'env (Render → Environment) :
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
  * DISCORD_WEBHOOK=<ton webhook Discord>
  * SCAN_EVERY_MS=1500
@@ -14,7 +14,7 @@ import express from 'express';
  * CLOSE_CONFIRM_SCANS=3
  * STATE_FILE=state.json
  * PORT=10000
- * (ajoute aussi PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer et PUPPETEER_SKIP_DOWNLOAD=false)
+ *  (⚠️ Supprime PUPPETEER_EXECUTABLE_PATH, PUPPETEER_SKIP_DOWNLOAD, etc.)
  */
 
 const {
@@ -45,7 +45,7 @@ async function notifyDiscord(content){
   catch(e){ console.error('Discord error:', e); }
 }
 
-// ---------- Selectors (d’après ton HTML) ----------
+// ---------- Selectors (selon ton HTML) ----------
 const SEL = {
   row: 'tr.ant-table-row.ant-table-row-level-0',
   orderId: 'td:nth-child(9) .data',
@@ -82,9 +82,13 @@ let browser, page, lastReload=0, lastScanAt=0;
 async function ensureBrowser(){
   if (browser && page) return;
 
-  // On laisse Puppeteer choisir SON Chromium (executablePath auto)
+  // 👉 utilise le Chrome téléchargé par Puppeteer (grâce au prestart)
+  const exePath = puppeteer.executablePath();
+  console.log('➡️  Using Chromium at:', exePath);
+
   browser = await puppeteer.launch({
     headless: 'new',
+    executablePath: exePath,
     args: [
       '--no-sandbox','--disable-setuid-sandbox',
       '--disable-dev-shm-usage','--disable-gpu',
