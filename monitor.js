@@ -6,17 +6,15 @@ import puppeteer from 'puppeteer';
 import express from 'express';
 
 /**
- * ============ CONFIG via variables d'environnement ============
- * (tu les définiras dans Render → Environment → Environment Variables)
- *
- * TRADER_URL          : URL publique du trader (onglet "Ordres principaux")
- * DISCORD_WEBHOOK     : URL de ton webhook Discord (secret)
- * SCAN_EVERY_MS       : fréquence de scan DOM (ms), ex. "1500"
- * RELOAD_EVERY_MS     : reload périodique de la page (ms), ex. "15000"
- * OPEN_CONFIRM_SCANS  : # de scans pour confirmer une ouverture, ex. "1"
- * CLOSE_CONFIRM_SCANS : # de scans manquants pour confirmer une fermeture, ex. "3"
- * STATE_FILE          : fichier d'état (utile en local; éphémère sur Render), ex. "state.json"
- * PORT                : port HTTP (Render le fournit dans $PORT)
+ * Variables d’environnement à définir sur Render :
+ * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
+ * DISCORD_WEBHOOK=... (ton webhook Discord)
+ * SCAN_EVERY_MS=1500
+ * RELOAD_EVERY_MS=15000
+ * OPEN_CONFIRM_SCANS=1
+ * CLOSE_CONFIRM_SCANS=3
+ * STATE_FILE=state.json
+ * PORT=10000   (Render injectera sa propre valeur dans $PORT)
  */
 
 const {
@@ -27,15 +25,15 @@ const {
   OPEN_CONFIRM_SCANS = '1',
   CLOSE_CONFIRM_SCANS = '3',
   STATE_FILE = 'state.json',
-  PORT = '3000'
+  PORT = process.env.PORT || '3000'
 } = process.env;
 
 if (!TRADER_URL || !DISCORD_WEBHOOK) {
-  console.error('⚠️  TRADER_URL et/ou DISCORD_WEBHOOK manquants. Renseigne-les dans les variables d’environnement.');
+  console.error('⚠️  TRADER_URL et/ou DISCORD_WEBHOOK manquants.');
   process.exit(1);
 }
 
-// ----------- State (persistant en local, éphémère sur Render) -----------
+// ---------- State ----------
 function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
   catch { return {}; }
@@ -43,10 +41,9 @@ function loadState() {
 function saveState(s) {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {}
 }
-// state = { [orderId]: { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime } }
 let state = loadState();
 
-// ----------- Utilitaires -----------
+// ---------- Utils ----------
 const sideEmoji = (side) => /long/i.test(side) ? '🟢⬆️' : (/short/i.test(side) ? '🔴⬇️' : 'ℹ️');
 async function notifyDiscord(content) {
   try {
@@ -55,21 +52,17 @@ async function notifyDiscord(content) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ content })
     });
-  } catch (e) {
-    console.error('Discord error:', e);
-  }
+  } catch (e) { console.error('Discord error:', e); }
 }
 
-// Sélecteurs DOM (basés sur l'HTML que tu as fourni)
 const SEL = {
-  row: 'tr.ant-table-row.ant-table-row-level-0', // chaque ordre
-  orderId: 'td:nth-child(9) .data',              // cellule contenant le numéro d'ordre
-  firstCell: 'td:nth-child(1)',                  // "SOLUSDT ... Short/Long ... 25x"
-  avgPrice: 'td:nth-child(4)',                   // prix moyen (si présent)
-  openTs: 'td:nth-child(8)'                      // date/heure d'ouverture (si présent)
+  row: 'tr.ant-table-row.ant-table-row-level-0',
+  orderId: 'td:nth-child(9) .data',
+  firstCell: 'td:nth-child(1)',
+  avgPrice: 'td:nth-child(4)',
+  openTs: 'td:nth-child(8)'
 };
 
-// Exécuté DANS la page pour récupérer les ordres visibles
 async function parseVisibleOrders(page) {
   return await page.evaluate((SEL) => {
     const text = (el) => (el ? (el.innerText || el.textContent || '').trim() : '');
@@ -95,22 +88,29 @@ async function parseVisibleOrders(page) {
   }, SEL);
 }
 
-// ----------- Boucle principale Puppeteer -----------
-const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS, 10);   // ex. 1
-const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS, 10);  // ex. 3
+// ---------- Puppeteer Loop ----------
+const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS, 10);
+const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS, 10);
 
 let browser, page, lastReload = 0, lastScanAt = 0;
 
 async function ensureBrowser() {
   if (browser && page) return;
+
+  const exePath =
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    (puppeteer.executablePath ? puppeteer.executablePath() : undefined);
+
   browser = await puppeteer.launch({
     headless: 'new',
+    executablePath: exePath,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
       '--lang=fr-FR,fr'
     ]
   });
+
   page = await browser.newPage();
   await page.setViewport({ width: 1366, height: 768 });
   await page.setUserAgent(
@@ -127,7 +127,6 @@ async function scanCycle() {
   try {
     await ensureBrowser();
 
-    // Reload périodique : certaines pages LBank ne “poussent” pas les mises à jour
     if (Date.now() - lastReload >= parseInt(RELOAD_EVERY_MS, 10)) {
       await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
       lastReload = Date.now();
@@ -135,10 +134,9 @@ async function scanCycle() {
 
     const items = await parseVisibleOrders(page);
     lastScanAt = Date.now();
-
     const visible = new Set(items.map(o => o.id));
 
-    // Mettre à jour l'état pour chaque ligne visible
+    // update visibles
     for (const d of items) {
       if (!state[d.id]) {
         state[d.id] = {
@@ -158,7 +156,7 @@ async function scanCycle() {
       }
     }
 
-    // ✅ OUVERTURES : une ligne visible confirmée => alerte
+    // OUVERTURES
     for (const [id, st] of Object.entries(state)) {
       if (!st.openedNotified && (st.seen || 0) >= OPEN_N) {
         const arrow = sideEmoji(st.side);
@@ -176,7 +174,7 @@ async function scanCycle() {
       }
     }
 
-    // ✅ FERMETURES : ligne confirmée qui disparaît assez longtemps => alerte
+    // FERMETURES
     for (const [id, st] of Object.entries(state)) {
       if (visible.has(id)) continue;
       if (!st.closedNotified && (st.seen || 0) >= OPEN_N) {
@@ -196,7 +194,6 @@ async function scanCycle() {
           st.closedNotified = true;
         }
       } else if ((st.seen || 0) < OPEN_N) {
-        // jamais confirmé -> on nettoie
         st.missing = (st.missing || 0) + 1;
         if (st.missing >= 2) delete state[id];
       }
@@ -208,15 +205,12 @@ async function scanCycle() {
   }
 }
 
-// ----------- Petit serveur HTTP (keep-alive + outils) -----------
+// ---------- HTTP server (keep-alive + tools) ----------
 const app = express();
-
-// Indique que l'app tourne (UptimeRobot pointera ici)
+app.get('/', (_, res) => res.send('OK'));
 app.get('/health', (_, res) => {
   res.json({ ok: true, lastScanAt, lastReload, watching: TRADER_URL });
 });
-
-// Marque toutes les lignes visibles comme "déjà vues" (évite un flood initial)
 app.get('/baseline', async (_, res) => {
   try {
     await ensureBrowser();
@@ -236,11 +230,9 @@ app.get('/baseline', async (_, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-
-// Render impose d'écouter sur process.env.PORT
 app.listen(parseInt(PORT, 10), () => {
   console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`);
 });
 
-// ----------- Lancement de la boucle de scan -----------
+// ---------- Launch loop ----------
 setInterval(scanCycle, parseInt(SCAN_EVERY_MS, 10));
