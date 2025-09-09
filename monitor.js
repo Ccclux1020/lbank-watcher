@@ -1,11 +1,12 @@
-// monitor.js — Puppeteer télécharge Chrome au démarrage (prestart), on utilise son executablePath
+// monitor.js — Puppeteer prestart + fallback automatique vers le cache Render
 import 'dotenv/config';
 import fs from 'fs';
+import path from 'path';
 import fetch from 'node-fetch';
 import puppeteer from 'puppeteer';
 import express from 'express';
 
-/** Variables d'env (Render → Environment) :
+/** Env (Render → Environment) :
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
  * DISCORD_WEBHOOK=<ton webhook Discord>
  * SCAN_EVERY_MS=1500
@@ -14,7 +15,6 @@ import express from 'express';
  * CLOSE_CONFIRM_SCANS=3
  * STATE_FILE=state.json
  * PORT=10000
- *  (⚠️ Supprime PUPPETEER_EXECUTABLE_PATH, PUPPETEER_SKIP_DOWNLOAD, etc.)
  */
 
 const {
@@ -33,19 +33,19 @@ if (!TRADER_URL || !DISCORD_WEBHOOK) {
   process.exit(1);
 }
 
-// ---------- State ----------
+// --------- State ----------
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s){ try { fs.writeFileSync(STATE_FILE, JSON.stringify(s,null,2)); } catch {} }
-let state = loadState(); // state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
+let state = loadState();
 
-// ---------- Utils ----------
+// --------- Utils ----------
 const sideEmoji = (side)=> /long/i.test(side) ? '🟢⬆️' : (/short/i.test(side) ? '🔴⬇️' : 'ℹ️');
 async function notifyDiscord(content){
   try { await fetch(DISCORD_WEBHOOK,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})}); }
   catch(e){ console.error('Discord error:', e); }
 }
 
-// ---------- Selectors (selon ton HTML) ----------
+// --------- Sélecteurs (selon ton HTML) ----------
 const SEL = {
   row: 'tr.ant-table-row.ant-table-row-level-0',
   orderId: 'td:nth-child(9) .data',
@@ -73,7 +73,37 @@ async function parseVisibleOrders(page){
   }, SEL);
 }
 
-// ---------- Puppeteer loop ----------
+// --------- Fallback: chercher Chrome dans le cache Render ---------
+function findChromeInCache() {
+  const root = '/opt/render/.cache/puppeteer';
+  let found = null;
+  function walk(dir, depth = 0) {
+    if (found || depth > 7) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (e.name === 'chrome') { found = p; return; }
+    }
+  }
+  walk(root);
+  return found;
+}
+
+function getExecutablePath() {
+  // 1) ce que donne Puppeteer (si Chromium a été trouvé/configuré)
+  try {
+    const p = puppeteer.executablePath();
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+  // 2) sinon on scanne le cache Render
+  const c = findChromeInCache();
+  if (c && fs.existsSync(c)) return c;
+  return null;
+}
+
+// --------- Puppeteer loop ----------
 const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS,10);
 const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS,10);
 
@@ -82,9 +112,13 @@ let browser, page, lastReload=0, lastScanAt=0;
 async function ensureBrowser(){
   if (browser && page) return;
 
-  // 👉 utilise le Chrome téléchargé par Puppeteer (grâce au prestart)
-  const exePath = puppeteer.executablePath();
-  console.log('➡️  Using Chromium at:', exePath);
+  const exePath = getExecutablePath();
+  if (!exePath) {
+    console.error('❌ Aucun binaire Chrome/Chromium trouvé (ni via Puppeteer, ni dans /opt/render/.cache/puppeteer).');
+    console.error('➡️ Vérifie que le prestart a bien tourné et que les logs montrent un download Chrome.');
+    return;
+  }
+  console.log('➡️ Using browser at:', exePath);
 
   browser = await puppeteer.launch({
     headless: 'new',
@@ -109,6 +143,7 @@ async function ensureBrowser(){
 async function scanCycle(){
   try{
     await ensureBrowser();
+    if (!page) return;
 
     if (Date.now()-lastReload >= parseInt(RELOAD_EVERY_MS,10)) {
       await page.reload({ waitUntil:'networkidle2', timeout:60000 });
@@ -146,7 +181,7 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
       }
     }
 
-    // Fermetures (disparition)
+    // Fermetures
     for(const [id,st] of Object.entries(state)){
       if (visible.has(id)) continue;
 
@@ -174,13 +209,14 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
   }
 }
 
-// ---------- HTTP (keep-alive + outils) ----------
+// --------- HTTP (keep-alive + outils) ----------
 const app = express();
 app.get('/', (_,res)=>res.send('OK'));
 app.get('/health', (_,res)=>res.json({ ok:true, lastScanAt, lastReload, watching:TRADER_URL }));
 app.get('/baseline', async (_,res)=>{
   try{
     await ensureBrowser();
+    if (!page) return res.json({ ok:false, error:'browser not ready' });
     const items = await parseVisibleOrders(page);
     for(const d of items){
       state[d.id]={seen:Math.max(state[d.id]?.seen||0,OPEN_N),missing:0,
