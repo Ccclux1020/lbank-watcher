@@ -1,12 +1,11 @@
-// monitor.js — Render + puppeteer-core + détection Chrome robuste
+// monitor.js — version simple & robuste (Puppeteer télécharge son Chromium)
 import 'dotenv/config';
 import fs from 'fs';
-import path from 'path';
 import fetch from 'node-fetch';
-import puppeteer from 'puppeteer-core';
+import puppeteer from 'puppeteer';
 import express from 'express';
 
-/** Env (Render → Environment → Add):
+/** Env (Render → Environment) :
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
  * DISCORD_WEBHOOK=<ton webhook Discord>
  * SCAN_EVERY_MS=1500
@@ -15,6 +14,7 @@ import express from 'express';
  * CLOSE_CONFIRM_SCANS=3
  * STATE_FILE=state.json
  * PORT=10000
+ * (ajoute aussi PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer et PUPPETEER_SKIP_DOWNLOAD=false)
  */
 
 const {
@@ -33,21 +33,19 @@ if (!TRADER_URL || !DISCORD_WEBHOOK) {
   process.exit(1);
 }
 
-// ---------------- State ----------------
+// ---------- State ----------
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s){ try { fs.writeFileSync(STATE_FILE, JSON.stringify(s,null,2)); } catch {} }
-// state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
-let state = loadState();
+let state = loadState(); // state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
 
-// ---------------- Utils ----------------
+// ---------- Utils ----------
 const sideEmoji = (side)=> /long/i.test(side) ? '🟢⬆️' : (/short/i.test(side) ? '🔴⬇️' : 'ℹ️');
 async function notifyDiscord(content){
-  try {
-    await fetch(DISCORD_WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ content }) });
-  } catch (e) { console.error('Discord error:', e); }
+  try { await fetch(DISCORD_WEBHOOK,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})}); }
+  catch(e){ console.error('Discord error:', e); }
 }
 
-// ---- Sélecteurs LBank (d’après ton HTML) ----
+// ---------- Selectors (d’après ton HTML) ----------
 const SEL = {
   row: 'tr.ant-table-row.ant-table-row-level-0',
   orderId: 'td:nth-child(9) .data',
@@ -60,7 +58,7 @@ async function parseVisibleOrders(page){
   return await page.evaluate((SEL)=>{
     const text=(el)=>el?(el.innerText||el.textContent||'').trim():'';
     const norm=(s)=>(s||'').replace(/\s+/g,' ').trim();
-    const arr=[];
+    const out=[];
     for(const tr of document.querySelectorAll(SEL.row)){
       const id=(text(tr.querySelector(SEL.orderId))||'').replace(/\s+/g,''); if(!id) continue;
       const c1=norm(text(tr.querySelector(SEL.firstCell)));
@@ -69,40 +67,13 @@ async function parseVisibleOrders(page){
       const lev=(c1.match(/(\d+)\s*x/i)||[,''])[1]||'';
       const avgPrice=text(tr.querySelector(SEL.avgPrice))||'';
       const openTime=text(tr.querySelector(SEL.openTs))||'';
-      arr.push({ id, symbol, side, lev, avgPrice, openTime });
+      out.push({ id, symbol, side, lev, avgPrice, openTime });
     }
-    return arr;
+    return out;
   }, SEL);
 }
 
-// ------------- Détection “bulldozer” du binaire Chrome -------------
-function findChromePath() {
-  // 1) Si la variable est posée, on la respecte
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
-
-  // 2) Balaye tout le cache Puppeteer de Render (chrome/chromium, toutes versions)
-  const root = '/opt/render/.cache/puppeteer';
-  let found = null;
-
-  function walk(dir, depth = 0) {
-    if (found || depth > 7) return;
-    let entries = [];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        walk(p, depth + 1);
-      } else if (e.name === 'chrome') {
-        found = p;
-        return;
-      }
-    }
-  }
-  walk(root);
-  return found;
-}
-
-// ---------------- Boucle Puppeteer ----------------
+// ---------- Puppeteer loop ----------
 const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS,10);
 const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS,10);
 
@@ -111,19 +82,12 @@ let browser, page, lastReload=0, lastScanAt=0;
 async function ensureBrowser(){
   if (browser && page) return;
 
-  const exePath = findChromePath();
-  if (!exePath) {
-    console.error('❌ Chrome introuvable. Le build doit exécuter: npx puppeteer browsers install chrome@stable');
-    process.exit(1);
-  }
-  console.log('➡️  Chrome path:', exePath);
-
+  // On laisse Puppeteer choisir SON Chromium (executablePath auto)
   browser = await puppeteer.launch({
     headless: 'new',
-    executablePath: exePath,
     args: [
-      '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', '--disable-gpu',
+      '--no-sandbox','--disable-setuid-sandbox',
+      '--disable-dev-shm-usage','--disable-gpu',
       '--lang=fr-FR,fr'
     ]
   });
@@ -142,7 +106,6 @@ async function scanCycle(){
   try{
     await ensureBrowser();
 
-    // rechargement périodique (au cas où la page n’est pas live)
     if (Date.now()-lastReload >= parseInt(RELOAD_EVERY_MS,10)) {
       await page.reload({ waitUntil:'networkidle2', timeout:60000 });
       lastReload = Date.now();
@@ -152,11 +115,10 @@ async function scanCycle(){
     lastScanAt = Date.now();
     const visible = new Set(items.map(o=>o.id));
 
-    // maj visibles
     for(const d of items){
       if(!state[d.id]){
-        state[d.id] = { seen:1, missing:0, openedNotified:false, closedNotified:false,
-          symbol:d.symbol, side:d.side, lev:d.lev, avgPrice:d.avgPrice, openTime:d.openTime };
+        state[d.id]={seen:1,missing:0,openedNotified:false,closedNotified:false,
+          symbol:d.symbol,side:d.side,lev:d.lev,avgPrice:d.avgPrice,openTime:d.openTime};
       }else{
         const st=state[d.id];
         st.seen=Math.min((st.seen||0)+1, OPEN_N+3);
@@ -166,7 +128,7 @@ async function scanCycle(){
       }
     }
 
-    // ouvertures
+    // Ouvertures
     for(const [id,st] of Object.entries(state)){
       if(!st.openedNotified && (st.seen||0) >= OPEN_N){
         const arrow=sideEmoji(st.side);
@@ -180,7 +142,7 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
       }
     }
 
-    // fermetures (disparition)
+    // Fermetures (disparition)
     for(const [id,st] of Object.entries(state)){
       if (visible.has(id)) continue;
 
@@ -208,7 +170,7 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
   }
 }
 
-// ---------------- HTTP (keep-alive + outils) ----------------
+// ---------- HTTP (keep-alive + outils) ----------
 const app = express();
 app.get('/', (_,res)=>res.send('OK'));
 app.get('/health', (_,res)=>res.json({ ok:true, lastScanAt, lastReload, watching:TRADER_URL }));
@@ -217,32 +179,16 @@ app.get('/baseline', async (_,res)=>{
     await ensureBrowser();
     const items = await parseVisibleOrders(page);
     for(const d of items){
-      state[d.id] = { seen:Math.max(state[d.id]?.seen||0, OPEN_N), missing:0,
-        openedNotified:true, closedNotified:false,
-        symbol:d.symbol, side:d.side, lev:d.lev, avgPrice:d.avgPrice, openTime:d.openTime };
+      state[d.id]={seen:Math.max(state[d.id]?.seen||0,OPEN_N),missing:0,
+        openedNotified:true,closedNotified:false,
+        symbol:d.symbol,side:d.side,lev:d.lev,avgPrice:d.avgPrice,openTime:d.openTime};
     }
     saveState(state);
     res.json({ ok:true, baselineAdded: items.length });
-  }catch(e){
-    res.status(500).json({ ok:false, error:e.message });
-  }
+  }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
 });
-
-// route de debug pour lister le cache Puppeteer et afficher le chemin détecté
-app.get('/debug', (_, res) => {
-  const root = '/opt/render/.cache/puppeteer';
-  function list(dir, depth = 0) {
-    if (depth > 3) return [];
-    try {
-      return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
-        const p = path.join(dir, e.name);
-        return e.isDirectory() ? [p + '/'].concat(list(p, depth + 1)) : [p];
-      });
-    } catch { return []; }
-  }
-  res.json({ exe: findChromePath(), sample: list(root).slice(0, 150) });
-});
-
 app.listen(parseInt(PORT,10), ()=>console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`));
 
+// ▶️ scan immédiat + intervalle
+(async () => { try { await scanCycle(); } catch (e) { console.error('first scan error:', e.message); } })();
 setInterval(scanCycle, parseInt(SCAN_EVERY_MS,10));
