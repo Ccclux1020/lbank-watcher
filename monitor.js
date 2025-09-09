@@ -1,4 +1,4 @@
-// monitor.js — Render + puppeteer-core + auto-detect Chrome
+// monitor.js — Render + puppeteer-core + détection Chrome robuste
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -6,9 +6,9 @@ import fetch from 'node-fetch';
 import puppeteer from 'puppeteer-core';
 import express from 'express';
 
-/** Env (Render → Environment):
+/** Env (Render → Environment → Add):
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
- * DISCORD_WEBHOOK=... (ton webhook)
+ * DISCORD_WEBHOOK=<ton webhook Discord>
  * SCAN_EVERY_MS=1500
  * RELOAD_EVERY_MS=15000
  * OPEN_CONFIRM_SCANS=1
@@ -36,7 +36,8 @@ if (!TRADER_URL || !DISCORD_WEBHOOK) {
 // ---------------- State ----------------
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s){ try { fs.writeFileSync(STATE_FILE, JSON.stringify(s,null,2)); } catch {} }
-let state = loadState(); // { [orderId]: { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime } }
+// state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
+let state = loadState();
 
 // ---------------- Utils ----------------
 const sideEmoji = (side)=> /long/i.test(side) ? '🟢⬆️' : (/short/i.test(side) ? '🔴⬇️' : 'ℹ️');
@@ -74,25 +75,31 @@ async function parseVisibleOrders(page){
   }, SEL);
 }
 
-// ------------- Auto-détection du binaire Chrome installé au build -------------
+// ------------- Détection “bulldozer” du binaire Chrome -------------
 function findChromePath() {
-  // 1) si l’admin a quand même mis la variable, on la respecte
+  // 1) Si la variable est posée, on la respecte
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
 
-  // 2) chrome installé par "npx puppeteer browsers install chrome@stable"
-  const base = '/opt/render/.cache/puppeteer/chrome';
-  try {
-    const versions = fs.readdirSync(base, { withFileTypes: true })
-      .filter(d => d.isDirectory() && d.name.startsWith('linux-'))
-      .map(d => d.name)
-      .sort()
-      .reverse(); // prend la plus récente
-    for (const v of versions) {
-      const candidate = path.join(base, v, 'chrome-linux64', 'chrome');
-      if (fs.existsSync(candidate)) return candidate;
+  // 2) Balaye tout le cache Puppeteer de Render (chrome/chromium, toutes versions)
+  const root = '/opt/render/.cache/puppeteer';
+  let found = null;
+
+  function walk(dir, depth = 0) {
+    if (found || depth > 7) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(p, depth + 1);
+      } else if (e.name === 'chrome') {
+        found = p;
+        return;
+      }
     }
-  } catch {}
-  return null;
+  }
+  walk(root);
+  return found;
 }
 
 // ---------------- Boucle Puppeteer ----------------
@@ -106,7 +113,7 @@ async function ensureBrowser(){
 
   const exePath = findChromePath();
   if (!exePath) {
-    console.error('❌ Chrome introuvable. Assure-toi que le build a bien exécuté: npx puppeteer browsers install chrome@stable');
+    console.error('❌ Chrome introuvable. Le build doit exécuter: npx puppeteer browsers install chrome@stable');
     process.exit(1);
   }
   console.log('➡️  Chrome path:', exePath);
@@ -135,6 +142,7 @@ async function scanCycle(){
   try{
     await ensureBrowser();
 
+    // rechargement périodique (au cas où la page n’est pas live)
     if (Date.now()-lastReload >= parseInt(RELOAD_EVERY_MS,10)) {
       await page.reload({ waitUntil:'networkidle2', timeout:60000 });
       lastReload = Date.now();
@@ -219,6 +227,22 @@ app.get('/baseline', async (_,res)=>{
     res.status(500).json({ ok:false, error:e.message });
   }
 });
+
+// route de debug pour lister le cache Puppeteer et afficher le chemin détecté
+app.get('/debug', (_, res) => {
+  const root = '/opt/render/.cache/puppeteer';
+  function list(dir, depth = 0) {
+    if (depth > 3) return [];
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
+        const p = path.join(dir, e.name);
+        return e.isDirectory() ? [p + '/'].concat(list(p, depth + 1)) : [p];
+      });
+    } catch { return []; }
+  }
+  res.json({ exe: findChromePath(), sample: list(root).slice(0, 150) });
+});
+
 app.listen(parseInt(PORT,10), ()=>console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`));
 
 setInterval(scanCycle, parseInt(SCAN_EVERY_MS,10));
