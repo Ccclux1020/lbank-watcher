@@ -1,20 +1,21 @@
 // monitor.js
 import 'dotenv/config';
 import fs from 'fs';
+import path from 'path';
 import fetch from 'node-fetch';
 import puppeteer from 'puppeteer-core';
 import express from 'express';
 
 /**
- * Variables d’environnement (Render → Environment → Add):
+ * Variables Render → Environment:
  * TRADER_URL=https://www.lbank.com/fr/copy-trading/lead-trader/LBA8G34235
- * DISCORD_WEBHOOK=https://discord.com/api/webhooks/xxx/yyy
+ * DISCORD_WEBHOOK=... (ton webhook)
  * SCAN_EVERY_MS=1500
  * RELOAD_EVERY_MS=15000
  * OPEN_CONFIRM_SCANS=1
  * CLOSE_CONFIRM_SCANS=3
  * STATE_FILE=state.json
- * PORT=10000   (Render fournit sa propre valeur dans $PORT)
+ * PORT=10000
  */
 
 const {
@@ -34,28 +35,18 @@ if (!TRADER_URL || !DISCORD_WEBHOOK) {
 }
 
 // ---------- State ----------
-function loadState() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); }
-  catch { return {}; }
-}
-function saveState(s) {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {}
-}
-// state[orderId] = { seen, missing, openedNotified, closedNotified, symbol, side, lev, avgPrice, openTime }
+function loadState() { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } }
+function saveState(s) { try { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); } catch {} }
 let state = loadState();
 
 // ---------- Utils ----------
 const sideEmoji = (side) => /long/i.test(side) ? '🟢⬆️' : (/short/i.test(side) ? '🔴⬇️' : 'ℹ️');
 async function notifyDiscord(content) {
-  try {
-    await fetch(DISCORD_WEBHOOK, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ content })
-    });
-  } catch (e) { console.error('Discord error:', e); }
+  try { await fetch(DISCORD_WEBHOOK, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ content }) }); }
+  catch (e) { console.error('Discord error:', e); }
 }
 
+// ----- Sélecteurs (basés sur ton HTML) -----
 const SEL = {
   row: 'tr.ant-table-row.ant-table-row-level-0',
   orderId: 'td:nth-child(9) .data',
@@ -89,7 +80,46 @@ async function parseVisibleOrders(page) {
   }, SEL);
 }
 
-// ---------- Puppeteer loop ----------
+// ---------- Trouver Chrome sur Render ----------
+function findChromePath() {
+  // 1) le plus propre : Render la fournit
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+
+  // 2) installé par `@puppeteer/browsers` dans le cache Render
+  const base = '/opt/render/.cache/puppeteer'; // chemin de cache sur Render
+  try {
+    const entries = fs.readdirSync(base, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const dir = path.join(base, e.name);
+      // chemins typiques: chrome/linux-<ver>/chrome-linux64/chrome
+      const p1 = path.join(dir, 'chrome');
+      const p2 = path.join(dir, 'chrome', 'linux');
+      const candidates = [];
+
+      function walk(d) {
+        try {
+          const files = fs.readdirSync(d, { withFileTypes: true });
+          for (const f of files) {
+            const full = path.join(d, f.name);
+            if (f.isDirectory()) walk(full);
+            else if (f.name === 'chrome' || f.name === 'chrome-linux64' || f.name === 'chrome.exe') candidates.push(full);
+          }
+        } catch {}
+      }
+      walk(dir);
+      const bin = candidates.find(c => c.endsWith('/chrome')) || candidates.find(c => /chrome$/.test(c));
+      if (bin && fs.existsSync(bin)) return bin;
+    }
+  } catch {}
+
+  // 3) dernier recours: endroit parfois utilisé
+  if (fs.existsSync('/opt/render/.cache/puppeteer/chrome/linux-*/chrome')) return '/opt/render/.cache/puppeteer/chrome/linux-*/chrome';
+
+  return null;
+}
+
+// ---------- Boucle Puppeteer ----------
 const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS, 10);
 const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS, 10);
 
@@ -98,12 +128,12 @@ let browser, page, lastReload = 0, lastScanAt = 0;
 async function ensureBrowser() {
   if (browser && page) return;
 
-  // 👉 Render installe Chrome via @puppeteer/browsers et expose le chemin dans PUPPETEER_EXECUTABLE_PATH
-  const exePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  const exePath = findChromePath();
   if (!exePath) {
-    console.error('❌ PUPPETEER_EXECUTABLE_PATH manquant (build Chrome non effectué).');
+    console.error('❌ Impossible de trouver Chrome. Vérifie que le build a bien téléchargé Chrome (postinstall).');
     process.exit(1);
   }
+  console.log('➡️  Chrome path:', exePath);
 
   browser = await puppeteer.launch({
     headless: 'new',
@@ -131,7 +161,6 @@ async function scanCycle() {
   try {
     await ensureBrowser();
 
-    // Reload périodique (si l’UI ne pousse pas les updates)
     if (Date.now() - lastReload >= parseInt(RELOAD_EVERY_MS, 10)) {
       await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
       lastReload = Date.now();
@@ -141,7 +170,6 @@ async function scanCycle() {
     lastScanAt = Date.now();
     const visible = new Set(items.map(o => o.id));
 
-    // Mettre à jour l'état pour chaque ligne visible
     for (const d of items) {
       if (!state[d.id]) {
         state[d.id] = {
@@ -161,7 +189,6 @@ async function scanCycle() {
       }
     }
 
-    // ✅ Ouvertures
     for (const [id, st] of Object.entries(state)) {
       if (!st.openedNotified && (st.seen || 0) >= OPEN_N) {
         const arrow = sideEmoji(st.side);
@@ -179,7 +206,6 @@ async function scanCycle() {
       }
     }
 
-    // ✅ Fermetures (disparition)
     for (const [id, st] of Object.entries(state)) {
       if (visible.has(id)) continue;
 
@@ -200,7 +226,6 @@ async function scanCycle() {
           st.closedNotified = true;
         }
       } else if ((st.seen || 0) < OPEN_N) {
-        // jamais confirmé → purge
         st.missing = (st.missing || 0) + 1;
         if (st.missing >= 2) delete state[id];
       }
@@ -241,5 +266,4 @@ app.listen(parseInt(PORT, 10), () => {
   console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`);
 });
 
-// ---------- Loop ----------
 setInterval(scanCycle, parseInt(SCAN_EVERY_MS, 10));
