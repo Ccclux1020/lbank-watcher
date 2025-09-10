@@ -1,4 +1,4 @@
-// monitor.js — stealth + mutex + debug (/count,/html,/shot) + webhooks Discord
+// monitor.js — stealth + mutex nav global + safeEval + endpoints non-bloquants + webhooks
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -7,18 +7,17 @@ import puppeteerCore from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import express from 'express';
-
 puppeteer.use(StealthPlugin());
 
 // ===== ENV =====
 const TRADER_URL          = process.env.TRADER_URL || '';
 const DISCORD_WEBHOOK     = process.env.DISCORD_WEBHOOK || '';
-const SCAN_EVERY_MS       = process.env.SCAN_EVERY_MS || '7000';
-const RELOAD_EVERY_MS     = process.env.RELOAD_EVERY_MS || '30000';
-const OPEN_CONFIRM_SCANS  = process.env.OPEN_CONFIRM_SCANS || '1';
-const CLOSE_CONFIRM_SCANS = process.env.CLOSE_CONFIRM_SCANS || '3';
+const SCAN_EVERY_MS       = parseInt(process.env.SCAN_EVERY_MS || '7000', 10);
+const RELOAD_EVERY_MS     = parseInt(process.env.RELOAD_EVERY_MS || '30000', 10);
+const OPEN_CONFIRM_SCANS  = parseInt(process.env.OPEN_CONFIRM_SCANS || '1', 10);
+const CLOSE_CONFIRM_SCANS = parseInt(process.env.CLOSE_CONFIRM_SCANS || '3', 10);
 const STATE_FILE          = process.env.STATE_FILE || 'state.json';
-const PORT                = process.env.PORT || '3000';
+const PORT                = parseInt(process.env.PORT || '3000', 10);
 
 console.log('ENV seen:', {
   TRADER_URL: !!TRADER_URL,
@@ -47,46 +46,14 @@ async function notifyDiscord(content){
 const SEL = {
   row: 'tbody tr.ant-table-row, tr.ant-table-row.ant-table-row-level-0',
   orderIdCandidates: [
-    'td:nth-child(9) .data',          // cible attendue
-    'td:nth-child(9)',                 // fallback innerText
-    'td .data'                         // dernier recours
+    'td:nth-child(9) .data',
+    'td:nth-child(9)',
+    'td .data'
   ],
   firstCell: 'td:nth-child(1)',
   avgPrice:  'td:nth-child(4)',
   openTs:    'td:nth-child(8)'
 };
-
-async function parseVisibleOrders(page){
-  return await page.evaluate((SEL)=>{
-    const text=(el)=>el?(el.innerText||el.textContent||'').trim():'';
-    const norm=(s)=>(s||'').replace(/\s+/g,' ').trim();
-    const out=[];
-    const rows = document.querySelectorAll(SEL.row);
-    rows.forEach(tr=>{
-      let id='';
-      for (const sel of SEL.orderIdCandidates){
-        const el = tr.querySelector(sel);
-        const t  = (el?(el.innerText||el.textContent):'')||'';
-        const c  = t.replace(/\s+/g,'').trim();
-        if (c){ id=c; break; }
-      }
-      if(!id){
-        // dernier fallback: hash simple du texte de ligne (évite de perdre l'info)
-        const raw = norm(tr.innerText||'');
-        if (!raw) return;
-        id = 'row_'+raw.slice(0,50).replace(/[^A-Za-z0-9]/g,'_');
-      }
-      const c1=norm(text(tr.querySelector(SEL.firstCell)));
-      const symbol=(c1.match(/[A-Z]{2,}USDT/)||[])[0]||'';
-      const side=/Short/i.test(c1)?'Short':(/Long/i.test(c1)?'Long':'');
-      const lev=(c1.match(/(\d+)\s*x/i)||[,''])[1]||'';
-      const avgPrice=text(tr.querySelector(SEL.avgPrice))||'';
-      const openTime=text(tr.querySelector(SEL.openTs))||'';
-      out.push({ id, symbol, side, lev, avgPrice, openTime });
-    });
-    return out;
-  }, SEL);
-}
 
 // ===== CHROME PATH =====
 function findChromeInCache() {
@@ -125,17 +92,52 @@ async function tryAcceptConsent(page){
     }
   }catch{}
 }
-
 async function waitForTable(page){
   try{ await page.waitForSelector(SEL.row,{timeout:90000}); return true; }catch{ return false; }
 }
 
-// ===== MAIN LOOP =====
-const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS,10);
-const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS,10);
+// safe evaluate with timeout (évite pendings)
+async function safeEval(fn, timeoutMs=15000){
+  return await Promise.race([
+    fn(),
+    new Promise((_,reject)=>setTimeout(()=>reject(new Error('eval timeout')), timeoutMs))
+  ]);
+}
 
+async function parseVisibleOrders(page){
+  return await safeEval(() => page.evaluate((SEL)=>{
+    const text=(el)=>el?(el.innerText||el.textContent||'').trim():'';
+    const norm=(s)=>(s||'').replace(/\s+/g,' ').trim();
+    const out=[];
+    const rows = document.querySelectorAll(SEL.row);
+    rows.forEach(tr=>{
+      let id='';
+      for (const sel of SEL.orderIdCandidates){
+        const el = tr.querySelector(sel);
+        const t  = (el?(el.innerText||el.textContent):'')||'';
+        const c  = t.replace(/\s+/g,'').trim();
+        if (c){ id=c; break; }
+      }
+      if(!id){
+        const raw = norm(tr.innerText||'');
+        if (!raw) return;
+        id = 'row_'+raw.slice(0,50).replace(/[^A-Za-z0-9]/g,'_');
+      }
+      const c1=norm(text(tr.querySelector(SEL.firstCell)));
+      const symbol=(c1.match(/[A-Z]{2,}USDT/)||[])[0]||'';
+      const side=/Short/i.test(c1)?'Short':(/Long/i.test(c1)?'Long':'');
+      const lev=(c1.match(/(\d+)\s*x/i)||[,''])[1]||'';
+      const avgPrice=text(tr.querySelector(SEL.avgPrice))||'';
+      const openTime=text(tr.querySelector(SEL.openTs))||'';
+      out.push({ id, symbol, side, lev, avgPrice, openTime });
+    });
+    return out;
+  }, SEL));
+}
+
+// ===== MAIN LOOP =====
 let browser, page, lastReload=0, lastScanAt=0;
-let isNavigating=false;
+let isNavigating=false;   // mutex global
 
 async function navigate(url){
   if(!page) return false;
@@ -170,11 +172,11 @@ async function ensureBrowser(){
     '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
     '--single-process','--no-zygote','--force-color-profile=srgb','--mute-audio'
   ];
-  browser = await puppeteer.launch({ headless:true, executablePath:exePath, args:baseArgs, protocolTimeout:120000 });
+  browser = await puppeteer.launch({ headless:true, executablePath:exePath, args:baseArgs, protocolTimeout:180000 });
   page = await browser.newPage();
-  page.setDefaultNavigationTimeout(120000);
-  page.setDefaultTimeout(120000);
-  await page.setViewport({width:1280, height:900});
+  page.setDefaultNavigationTimeout(180000);
+  page.setDefaultTimeout(180000);
+  await page.setViewport({ width: 1280, height: 900 });
   await page.setExtraHTTPHeaders({ 'Accept-Language':'fr-FR,fr;q=0.9,en;q=0.8' });
   await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36');
   await page.setRequestInterception(true);
@@ -194,11 +196,9 @@ async function scanCycle(){
   try{
     await ensureBrowser();
     if (!page) return;
-    if (isNavigating) return;
 
-    if (Date.now()-lastReload >= parseInt(RELOAD_EVERY_MS,10)){
-      await reloadSoft(); return;
-    }
+    if (isNavigating) return;                 // ne scanne pas pendant nav
+    if (Date.now()-lastReload >= RELOAD_EVERY_MS){ await reloadSoft(); return; }
 
     const tableOk = await page.$(SEL.row);
     if (!tableOk){ await reloadSoft(); return; }
@@ -215,7 +215,7 @@ async function scanCycle(){
           symbol:d.symbol, side:d.side, lev:d.lev, avgPrice:d.avgPrice, openTime:d.openTime};
       }else{
         const st=state[d.id];
-        st.seen=Math.min((st.seen||0)+1, OPEN_N+3);
+        st.seen=Math.min((st.seen||0)+1, OPEN_CONFIRM_SCANS+3);
         st.missing=0;
         st.symbol=d.symbol||st.symbol; st.side=d.side||st.side; st.lev=d.lev||st.lev;
         st.avgPrice=d.avgPrice||st.avgPrice; st.openTime=d.openTime||st.openTime;
@@ -224,7 +224,7 @@ async function scanCycle(){
 
     // ouvertures
     for(const [id,st] of Object.entries(state)){
-      if(!st.openedNotified && (st.seen||0)>=OPEN_N){
+      if(!st.openedNotified && (st.seen||0)>=OPEN_CONFIRM_SCANS){
         const arrow=sideEmoji(st.side);
         const msg =
 `${arrow} **Ouverture de position (${st.side||'N/A'})**
@@ -236,12 +236,12 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
       }
     }
 
-    // fermetures (disparition)
+    // fermetures
     for(const [id,st] of Object.entries(state)){
       if (visible.has(id)) continue;
-      if(!st.closedNotified && (st.seen||0)>=OPEN_N){
+      if(!st.closedNotified && (st.seen||0)>=OPEN_CONFIRM_SCANS){
         st.missing=(st.missing||0)+1;
-        if (st.missing>=parseInt(CLOSE_CONFIRM_SCANS,10)){
+        if (st.missing>=CLOSE_CONFIRM_SCANS){
           const arrow=sideEmoji(st.side);
           const msg =
 `✅ ${arrow} **Fermeture de position (${st.side||'N/A'})**
@@ -251,7 +251,7 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
           console.log('📣 Fermeture', id);
           st.closedNotified=true;
         }
-      } else if ((st.seen||0)<OPEN_N){
+      } else if ((st.seen||0)<OPEN_CONFIRM_SCANS){
         st.missing=(st.missing||0)+1;
         if (st.missing>=2) delete state[id];
       }
@@ -263,17 +263,19 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
   }
 }
 
-// ===== HTTP (keep-alive + debug) =====
+// ===== HTTP (keep-alive + debug sûrs) =====
 const app = express();
 app.get('/', (_,res)=>res.send('OK'));
 app.get('/health', (_,res)=>res.json({ ok:true, lastScanAt, lastReload, watching:TRADER_URL }));
+
 app.get('/baseline', async (_,res)=>{
   try{
+    if (isNavigating) return res.json({ ok:false, navigating:true });
     await ensureBrowser();
     if (!page) return res.json({ ok:false, error:'browser not ready' });
     const items = await parseVisibleOrders(page);
     for(const d of items){
-      state[d.id]={ seen: Math.max(state[d.id]?.seen||0, parseInt(OPEN_CONFIRM_SCANS,10)),
+      state[d.id]={ seen: Math.max(state[d.id]?.seen||0, OPEN_CONFIRM_SCANS),
         missing:0, openedNotified:true, closedNotified:false,
         symbol:d.symbol, side:d.side, lev:d.lev, avgPrice:d.avgPrice, openTime:d.openTime };
     }
@@ -281,24 +283,37 @@ app.get('/baseline', async (_,res)=>{
     res.json({ ok:true, baselineAdded: items.length });
   }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
 });
+
 app.get('/count', async (_,res)=>{
-  try{ await ensureBrowser(); if (!page) return res.json({ok:false});
-       const items=await parseVisibleOrders(page); res.json({ok:true, rows:items.length}); }
-  catch(e){ res.json({ok:false, error:e.message}); }
+  try{
+    if (isNavigating) return res.json({ ok:false, navigating:true });
+    await ensureBrowser();
+    if (!page) return res.json({ ok:false, error:'browser not ready' });
+    const items = await parseVisibleOrders(page);
+    res.json({ ok:true, rows: items.length });
+  }catch(e){ res.json({ ok:false, error:e.message }); }
 });
+
 app.get('/html', async (_,res)=>{
-  try{ await ensureBrowser(); if (!page) return res.status(503).send('browser not ready');
-       const html = await page.content();
-       res.type('text/plain').send(html.slice(0,20000)); // tronque pour éviter d’exploser la RAM
+  try{
+    if (isNavigating) return res.status(409).send('navigating');
+    await ensureBrowser(); if (!page) return res.status(503).send('browser not ready');
+    const html = await safeEval(() => page.content(), 15000);
+    res.type('text/plain').send(html.slice(0, 20000));
   }catch(e){ res.status(500).send(e.message); }
 });
+
 app.get('/shot', async (_,res)=>{
-  try{ await ensureBrowser(); if (!page) return res.status(503).send('browser not ready');
-       const buf = await page.screenshot({fullPage:true}); res.type('image/png').send(buf);
+  try{
+    if (isNavigating) return res.status(409).send('navigating');
+    await ensureBrowser(); if (!page) return res.status(503).send('browser not ready');
+    const buf = await safeEval(() => page.screenshot({ fullPage:true }), 15000);
+    res.type('image/png').send(buf);
   }catch(e){ res.status(500).send(e.message); }
 });
-app.listen(parseInt(PORT,10), ()=>console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`));
+
+app.listen(PORT, ()=>console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`));
 
 // ===== START =====
 (async () => { try { await scanCycle(); } catch (e) { console.error('first scan error:', e.message); } })();
-setInterval(scanCycle, parseInt(SCAN_EVERY_MS,10));
+setInterval(scanCycle, SCAN_EVERY_MS);
