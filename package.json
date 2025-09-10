@@ -1,6 +1,6 @@
 {
   "name": "lbank-discord-watcher",
-  "version": "2.8.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "postinstall": "npx puppeteer browsers install chrome@stable --path=/opt/render/.cache/puppeteer",
