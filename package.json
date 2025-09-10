@@ -3,6 +3,7 @@
   "version": "2.3.0",
   "type": "module",
   "scripts": {
+    "postinstall": "npx puppeteer browsers install chrome@stable --path=/opt/render/.cache/puppeteer",
     "prestart": "npx puppeteer browsers install chrome@stable --path=/opt/render/.cache/puppeteer",
     "start": "node monitor.js"
   },
