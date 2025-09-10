@@ -1,4 +1,4 @@
-// monitor.js — stealth + mutex nav global + safeEval + endpoints non-bloquants + webhooks
+// monitor.js — stealth + mutex + iframes support + endpoints debug + webhooks
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -19,16 +19,8 @@ const CLOSE_CONFIRM_SCANS = parseInt(process.env.CLOSE_CONFIRM_SCANS || '3', 10)
 const STATE_FILE          = process.env.STATE_FILE || 'state.json';
 const PORT                = parseInt(process.env.PORT || '3000', 10);
 
-console.log('ENV seen:', {
-  TRADER_URL: !!TRADER_URL,
-  DISCORD_WEBHOOK: !!DISCORD_WEBHOOK,
-  SCAN_EVERY_MS, RELOAD_EVERY_MS, PORT
-});
-
-if (!TRADER_URL || !DISCORD_WEBHOOK) {
-  console.error('⚠️  TRADER_URL et/ou DISCORD_WEBHOOK manquants. Arrêt.');
-  process.exit(1);
-}
+console.log('ENV seen:', { TRADER_URL: !!TRADER_URL, DISCORD_WEBHOOK: !!DISCORD_WEBHOOK, SCAN_EVERY_MS, RELOAD_EVERY_MS, PORT });
+if (!TRADER_URL || !DISCORD_WEBHOOK) { console.error('⚠️  TRADER_URL et/ou DISCORD_WEBHOOK manquants.'); process.exit(1); }
 
 // ===== STATE =====
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
@@ -42,20 +34,16 @@ async function notifyDiscord(content){
   catch(e){ console.error('Discord error:', e.message); }
 }
 
-// ===== SELECTEURS LBank (tolérants) =====
+// ===== SELECTEURS (peuvent changer côté LBank) =====
 const SEL = {
   row: 'tbody tr.ant-table-row, tr.ant-table-row.ant-table-row-level-0',
-  orderIdCandidates: [
-    'td:nth-child(9) .data',
-    'td:nth-child(9)',
-    'td .data'
-  ],
+  orderIdCandidates: ['td:nth-child(9) .data','td:nth-child(9)','td .data'],
   firstCell: 'td:nth-child(1)',
   avgPrice:  'td:nth-child(4)',
   openTs:    'td:nth-child(8)'
 };
 
-// ===== CHROME PATH =====
+// ===== Chrome path (Render) =====
 function findChromeInCache() {
   const root = '/opt/render/.cache/puppeteer';
   let found = null;
@@ -68,8 +56,7 @@ function findChromeInCache() {
       else if (e.name==='chrome'){ found=p; return; }
     }
   }
-  walk(root);
-  return found;
+  walk(root); return found;
 }
 function getExecutablePath(){
   try{ const p = puppeteerCore.executablePath(); if (p && fs.existsSync(p)) return p; }catch{}
@@ -77,7 +64,7 @@ function getExecutablePath(){
   return null;
 }
 
-// ===== HELPERS PAGE =====
+// ===== Helpers page =====
 async function tryAcceptConsent(page){
   try{
     await page.waitForTimeout(500);
@@ -92,11 +79,6 @@ async function tryAcceptConsent(page){
     }
   }catch{}
 }
-async function waitForTable(page){
-  try{ await page.waitForSelector(SEL.row,{timeout:90000}); return true; }catch{ return false; }
-}
-
-// safe evaluate with timeout (évite pendings)
 async function safeEval(fn, timeoutMs=15000){
   return await Promise.race([
     fn(),
@@ -104,8 +86,9 @@ async function safeEval(fn, timeoutMs=15000){
   ]);
 }
 
-async function parseVisibleOrders(page){
-  return await safeEval(() => page.evaluate((SEL)=>{
+// --- parse dans UN frame donné ---
+async function parseOrdersInFrame(frame){
+  return await safeEval(() => frame.evaluate((SEL)=>{
     const text=(el)=>el?(el.innerText||el.textContent||'').trim():'';
     const norm=(s)=>(s||'').replace(/\s+/g,' ').trim();
     const out=[];
@@ -135,9 +118,37 @@ async function parseVisibleOrders(page){
   }, SEL));
 }
 
-// ===== MAIN LOOP =====
+// --- parse dans n'importe quel frame (retourne {items, frameUrl}) ---
+async function parseVisibleOrders(page){
+  const frames = page.frames();
+  for (const f of frames){
+    try{
+      const items = await parseOrdersInFrame(f);
+      if (items && items.length){ return { items, frameUrl: f.url() }; }
+    }catch{}
+  }
+  return { items: [], frameUrl: null };
+}
+
+// --- attendre la table dans n'importe quel frame ---
+async function waitForTableAnyFrame(page, timeoutMs=90000){
+  const start = Date.now();
+  while(Date.now() - start < timeoutMs){
+    const frames = page.frames();
+    for (const f of frames){
+      try{
+        const ok = await f.waitForSelector(SEL.row, { timeout: 1000 });
+        if (ok) return true;
+      }catch{}
+    }
+    await page.waitForTimeout(500);
+  }
+  return false;
+}
+
+// ===== Main loop =====
 let browser, page, lastReload=0, lastScanAt=0;
-let isNavigating=false;   // mutex global
+let isNavigating=false; // mutex
 
 async function navigate(url){
   if(!page) return false;
@@ -147,8 +158,9 @@ async function navigate(url){
     await page.goto(url,{waitUntil:'domcontentloaded', timeout:120000});
     await tryAcceptConsent(page);
     try{ await page.waitForNetworkIdle({idleTime:800, timeout:10000}); }catch{}
-    const ok = await waitForTable(page);
+    const ok = await waitForTableAnyFrame(page, 90000);
     lastReload = Date.now();
+    console.log('Frames:', page.frames().length, '| table any frame:', ok);
     return ok;
   }catch(e){
     console.error('navigate error:', e.message);
@@ -197,14 +209,12 @@ async function scanCycle(){
     await ensureBrowser();
     if (!page) return;
 
-    if (isNavigating) return;                 // ne scanne pas pendant nav
+    if (isNavigating) return;
     if (Date.now()-lastReload >= RELOAD_EVERY_MS){ await reloadSoft(); return; }
 
-    const tableOk = await page.$(SEL.row);
-    if (!tableOk){ await reloadSoft(); return; }
+    const { items, frameUrl } = await parseVisibleOrders(page);
+    console.log('Rows visibles:', items.length, '| frame:', frameUrl || 'none');
 
-    const items = await parseVisibleOrders(page);
-    console.log('Rows visibles:', items.length);
     lastScanAt = Date.now();
     const visible = new Set(items.map(o=>o.id));
 
@@ -263,7 +273,7 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
   }
 }
 
-// ===== HTTP (keep-alive + debug sûrs) =====
+// ===== HTTP (keep-alive + debug) =====
 const app = express();
 app.get('/', (_,res)=>res.send('OK'));
 app.get('/health', (_,res)=>res.json({ ok:true, lastScanAt, lastReload, watching:TRADER_URL }));
@@ -271,9 +281,8 @@ app.get('/health', (_,res)=>res.json({ ok:true, lastScanAt, lastReload, watching
 app.get('/baseline', async (_,res)=>{
   try{
     if (isNavigating) return res.json({ ok:false, navigating:true });
-    await ensureBrowser();
-    if (!page) return res.json({ ok:false, error:'browser not ready' });
-    const items = await parseVisibleOrders(page);
+    await ensureBrowser(); if (!page) return res.json({ ok:false, error:'browser not ready' });
+    const { items } = await parseVisibleOrders(page);
     for(const d of items){
       state[d.id]={ seen: Math.max(state[d.id]?.seen||0, OPEN_CONFIRM_SCANS),
         missing:0, openedNotified:true, closedNotified:false,
@@ -287,9 +296,8 @@ app.get('/baseline', async (_,res)=>{
 app.get('/count', async (_,res)=>{
   try{
     if (isNavigating) return res.json({ ok:false, navigating:true });
-    await ensureBrowser();
-    if (!page) return res.json({ ok:false, error:'browser not ready' });
-    const items = await parseVisibleOrders(page);
+    await ensureBrowser(); if (!page) return res.json({ ok:false, error:'browser not ready' });
+    const { items } = await parseVisibleOrders(page);
     res.json({ ok:true, rows: items.length });
   }catch(e){ res.json({ ok:false, error:e.message }); }
 });
@@ -298,7 +306,7 @@ app.get('/html', async (_,res)=>{
   try{
     if (isNavigating) return res.status(409).send('navigating');
     await ensureBrowser(); if (!page) return res.status(503).send('browser not ready');
-    const html = await safeEval(() => page.content(), 15000);
+    const html = await page.content();
     res.type('text/plain').send(html.slice(0, 20000));
   }catch(e){ res.status(500).send(e.message); }
 });
@@ -307,7 +315,7 @@ app.get('/shot', async (_,res)=>{
   try{
     if (isNavigating) return res.status(409).send('navigating');
     await ensureBrowser(); if (!page) return res.status(503).send('browser not ready');
-    const buf = await safeEval(() => page.screenshot({ fullPage:true }), 15000);
+    const buf = await page.screenshot({ fullPage:true });
     res.type('image/png').send(buf);
   }catch(e){ res.status(500).send(e.message); }
 });
