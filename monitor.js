@@ -1,4 +1,4 @@
-// monitor.js — stealth + mutex + iframes support + endpoints debug + webhooks
+// monitor.js — stealth + mutex + iframes + clic "Positions ouvertes" + endpoints debug
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -8,6 +8,9 @@ import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import express from 'express';
 puppeteer.use(StealthPlugin());
+
+// ===== helpers =====
+const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 
 // ===== ENV =====
 const TRADER_URL          = process.env.TRADER_URL || '';
@@ -34,7 +37,7 @@ async function notifyDiscord(content){
   catch(e){ console.error('Discord error:', e.message); }
 }
 
-// ===== SELECTEURS (peuvent changer côté LBank) =====
+// ===== SELECTEURS =====
 const SEL = {
   row: 'tbody tr.ant-table-row, tr.ant-table-row.ant-table-row-level-0',
   orderIdCandidates: ['td:nth-child(9) .data','td:nth-child(9)','td .data'],
@@ -64,10 +67,10 @@ function getExecutablePath(){
   return null;
 }
 
-// ===== Helpers page =====
+// ===== Page helpers =====
 async function tryAcceptConsent(page){
   try{
-    await page.waitForTimeout(500);
+    await sleep(500);
     const xs = [
       '//button[contains(., "Accepter") or contains(., "Tout accepter")]',
       '//button[contains(translate(., "ACEPT", "acept"), "accept")]',
@@ -75,7 +78,7 @@ async function tryAcceptConsent(page){
     ];
     for(const xp of xs){
       const [btn] = await page.$x(xp);
-      if (btn){ await btn.click({delay:20}); await page.waitForTimeout(300); break; }
+      if (btn){ await btn.click({delay:20}); await sleep(300); break; }
     }
   }catch{}
 }
@@ -86,7 +89,32 @@ async function safeEval(fn, timeoutMs=15000){
   ]);
 }
 
-// --- parse dans UN frame donné ---
+// cliquer l’onglet “Positions ouvertes / Open positions” dans n’importe quel frame
+async function clickOpenPositionsAnyFrame(page){
+  const frames = page.frames();
+  const xps = [
+    '//button[contains(., "Positions ouvertes")]',
+    '//a[contains(., "Positions ouvertes")]',
+    '//div[contains(@role,"tab") and (contains(., "Positions ouvertes") or contains(., "Open positions"))]',
+    '//button[contains(., "Open position") or contains(., "Open positions")]',
+    '//*[self::a or self::button or self::div][contains(translate(normalize-space(.),"OPENPOSITIONSOUVERTES","openpositionsouvertes"), "positions ouvertes") or contains(translate(normalize-space(.),"OPENPOSITIONS","openpositions"), "open positions")]'
+  ];
+  for (const f of frames){
+    try{
+      for (const xp of xps){
+        const [el] = await f.$x(xp);
+        if (el){
+          await el.click({delay:20});
+          await sleep(500);
+          return true;
+        }
+      }
+    }catch{}
+  }
+  return false;
+}
+
+// --- parse dans UN frame ---
 async function parseOrdersInFrame(frame){
   return await safeEval(() => frame.evaluate((SEL)=>{
     const text=(el)=>el?(el.innerText||el.textContent||'').trim():'';
@@ -137,11 +165,11 @@ async function waitForTableAnyFrame(page, timeoutMs=90000){
     const frames = page.frames();
     for (const f of frames){
       try{
-        const ok = await f.waitForSelector(SEL.row, { timeout: 1000 });
-        if (ok) return true;
+        const handle = await f.waitForSelector(SEL.row, { timeout: 1000 });
+        if (handle) return true;
       }catch{}
     }
-    await page.waitForTimeout(500);
+    await sleep(500);
   }
   return false;
 }
@@ -157,7 +185,8 @@ async function navigate(url){
   try{
     await page.goto(url,{waitUntil:'domcontentloaded', timeout:120000});
     await tryAcceptConsent(page);
-    try{ await page.waitForNetworkIdle({idleTime:800, timeout:10000}); }catch{}
+    await sleep(800);
+    await clickOpenPositionsAnyFrame(page); // activer l’onglet utile si besoin
     const ok = await waitForTableAnyFrame(page, 90000);
     lastReload = Date.now();
     console.log('Frames:', page.frames().length, '| table any frame:', ok);
