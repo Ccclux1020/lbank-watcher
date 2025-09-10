@@ -1,10 +1,10 @@
-// monitor.js — Render-ready: stealth + navigation robuste + webhooks Discord
+// monitor.js — Render-ready: stealth + mutex nav + reload/scan robustes + webhooks Discord
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import fetch from 'node-fetch';
 
-// On utilise puppeteer-core pour récupérer executablePath(), et puppeteer-extra pour le stealth.
+// puppeteer-core pour executablePath(); puppeteer-extra pour stealth
 import puppeteerCore from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
@@ -15,8 +15,8 @@ puppeteer.use(StealthPlugin());
 // -------------------- ENV --------------------
 const TRADER_URL          = process.env.TRADER_URL || '';
 const DISCORD_WEBHOOK     = process.env.DISCORD_WEBHOOK || '';
-const SCAN_EVERY_MS       = process.env.SCAN_EVERY_MS || '5000';   // scan toutes les 5s par défaut
-const RELOAD_EVERY_MS     = process.env.RELOAD_EVERY_MS || '30000';// reload doux toutes les 30s
+const SCAN_EVERY_MS       = process.env.SCAN_EVERY_MS || '7000';   // scan toutes les 7s
+const RELOAD_EVERY_MS     = process.env.RELOAD_EVERY_MS || '30000';// reload toutes les 30s
 const OPEN_CONFIRM_SCANS  = process.env.OPEN_CONFIRM_SCANS || '1';
 const CLOSE_CONFIRM_SCANS = process.env.CLOSE_CONFIRM_SCANS || '3';
 const STATE_FILE          = process.env.STATE_FILE || 'state.json';
@@ -143,7 +143,28 @@ async function waitForTable(page) {
 const OPEN_N  = parseInt(OPEN_CONFIRM_SCANS,10);
 const CLOSE_N = parseInt(CLOSE_CONFIRM_SCANS,10);
 
-let browser, page, lastReload=0, lastScanAt=0;
+let browser, page, lastReload = 0, lastScanAt = 0;
+
+// --- Mutex de navigation pour éviter collisions scan <-> goto ---
+let isNavigating = false;
+async function navigate(url) {
+  if (!page) return false;
+  if (isNavigating) return false;
+  isNavigating = true;
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+    await tryAcceptConsent(page);
+    try { await page.waitForNetworkIdle({ idleTime: 800, timeout: 10000 }); } catch {}
+    const ok = await waitForTable(page);
+    lastReload = Date.now();
+    return ok;
+  } catch (e) {
+    console.error('navigate error:', e.message);
+    return false;
+  } finally {
+    isNavigating = false;
+  }
+}
 
 async function ensureBrowser() {
   if (browser && page) return;
@@ -188,26 +209,16 @@ async function ensureBrowser() {
 
   console.log('🌐 Ouverture', TRADER_URL);
   try {
-    // Important: pas 'networkidle2' qui bloque souvent avec LBank
-    await page.goto(TRADER_URL, { waitUntil: 'domcontentloaded' });
-    await tryAcceptConsent(page);
-    await waitForTable(page);
-    lastReload = Date.now();
-    await notifyDiscord('🟢 LBank headless watcher démarré.');
+    const ok = await navigate(TRADER_URL);
+    if (ok) await notifyDiscord('🟢 LBank headless watcher démarré.');
   } catch (e) {
     console.error('❌ page.goto error:', e.message);
   }
 }
 
 async function reloadSoft() {
-  try {
-    await page.goto(TRADER_URL, { waitUntil: 'domcontentloaded' });
-    await tryAcceptConsent(page);
-    await waitForTable(page);
-    lastReload = Date.now();
-  } catch (e) {
-    console.error('reload error:', e.message);
-  }
+  const ok = await navigate(TRADER_URL);
+  if (!ok) console.warn('reloadSoft: table non trouvée après navigation.');
 }
 
 async function scanCycle(){
@@ -215,14 +226,21 @@ async function scanCycle(){
     await ensureBrowser();
     if (!page) return;
 
+    // si nav en cours, on saute ce tour
+    if (isNavigating) return;
+
     // reload périodique
-    if (Date.now() - lastReload >= parseInt(RELOAD_EVERY_MS,10)) {
+    if (Date.now() - lastReload >= parseInt(RELOAD_EVERY_MS, 10)) {
       await reloadSoft();
+      return; // ne scanne pas sur le même tick que le reload
     }
 
-    // si la table n'est plus là (scroll/MAJ DOM), on recharge
+    // si la table a disparu, on recharge
     const tableOk = await page.$(SEL.row);
-    if (!tableOk) await reloadSoft();
+    if (!tableOk) {
+      await reloadSoft();
+      return;
+    }
 
     const items = await parseVisibleOrders(page);
     lastScanAt = Date.now();
