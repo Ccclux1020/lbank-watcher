@@ -1,4 +1,4 @@
-// monitor.js — stealth + mutex + iframes + clic "Positions ouvertes" + endpoints debug
+// monitor.js — clique "Ordres principaux" (FR/EN), gère iframes/onglets, envoie Discord
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
@@ -9,10 +9,11 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import express from 'express';
 puppeteer.use(StealthPlugin());
 
-// ===== helpers =====
+// ---------- helpers ----------
 const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
+const norm = (s)=> (s||'').replace(/\s+/g,' ').trim();
 
-// ===== ENV =====
+// ---------- ENV ----------
 const TRADER_URL          = process.env.TRADER_URL || '';
 const DISCORD_WEBHOOK     = process.env.DISCORD_WEBHOOK || '';
 const SCAN_EVERY_MS       = parseInt(process.env.SCAN_EVERY_MS || '7000', 10);
@@ -25,28 +26,33 @@ const PORT                = parseInt(process.env.PORT || '3000', 10);
 console.log('ENV seen:', { TRADER_URL: !!TRADER_URL, DISCORD_WEBHOOK: !!DISCORD_WEBHOOK, SCAN_EVERY_MS, RELOAD_EVERY_MS, PORT });
 if (!TRADER_URL || !DISCORD_WEBHOOK) { console.error('⚠️  TRADER_URL et/ou DISCORD_WEBHOOK manquants.'); process.exit(1); }
 
-// ===== STATE =====
+// ---------- STATE ----------
 function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s){ try { fs.writeFileSync(STATE_FILE, JSON.stringify(s,null,2)); } catch {} }
 let state = loadState();
 
-// ===== UTILS =====
+// ---------- UTILS ----------
 const sideEmoji = s => /long/i.test(s) ? '🟢⬆️' : (/short/i.test(s) ? '🔴⬇️' : 'ℹ️');
 async function notifyDiscord(content){
   try { await fetch(DISCORD_WEBHOOK,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content})}); }
   catch(e){ console.error('Discord error:', e.message); }
 }
 
-// ===== SELECTEURS =====
+// ---------- SELECTEURS ----------
 const SEL = {
-  row: 'tbody tr.ant-table-row, tr.ant-table-row.ant-table-row-level-0',
-  orderIdCandidates: ['td:nth-child(9) .data','td:nth-child(9)','td .data'],
+  // lignes possibles (ant-table, ou fallback générique)
+  row: 'tbody tr.ant-table-row, tr.ant-table-row.ant-table-row-level-0, table tbody tr',
+  orderIdCandidates: [
+    'td:nth-child(9) .data',
+    'td:nth-child(9)',
+    'td .data'
+  ],
   firstCell: 'td:nth-child(1)',
   avgPrice:  'td:nth-child(4)',
   openTs:    'td:nth-child(8)'
 };
 
-// ===== Chrome path (Render) =====
+// ---------- Chrome path (Render) ----------
 function findChromeInCache() {
   const root = '/opt/render/.cache/puppeteer';
   let found = null;
@@ -67,10 +73,10 @@ function getExecutablePath(){
   return null;
 }
 
-// ===== Page helpers =====
+// ---------- Page helpers ----------
 async function tryAcceptConsent(page){
   try{
-    await sleep(500);
+    await sleep(400);
     const xs = [
       '//button[contains(., "Accepter") or contains(., "Tout accepter")]',
       '//button[contains(translate(., "ACEPT", "acept"), "accept")]',
@@ -82,6 +88,7 @@ async function tryAcceptConsent(page){
     }
   }catch{}
 }
+
 async function safeEval(fn, timeoutMs=15000){
   return await Promise.race([
     fn(),
@@ -89,32 +96,86 @@ async function safeEval(fn, timeoutMs=15000){
   ]);
 }
 
-// cliquer l’onglet “Positions ouvertes / Open positions” dans n’importe quel frame
-async function clickOpenPositionsAnyFrame(page){
+// --- collecte les onglets d’un frame ---
+async function listTabsInFrame(frame){
+  return await frame.evaluate(()=>{
+    function text(el){ return (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim(); }
+    const sels = [
+      '.ant-tabs-tab', '.ant-tabs-tab-btn', '.ant-segmented-item', '.ant-radio-button-wrapper',
+      'button', 'a', '[role="tab"]', '[data-tab-key]'
+    ];
+    const seen = new Set();
+    const items = [];
+    for (const sel of sels){
+      document.querySelectorAll(sel).forEach(el=>{
+        const t = text(el);
+        if (!t) return;
+        const key = t.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        items.push({ text:t, selector: sel });
+      });
+    }
+    return items;
+  });
+}
+
+// --- clique un onglet dont le libellé contient une des clés ci-dessous ---
+const OPEN_TAB_LABELS = [
+  // FR
+  'ordres principaux', 'positions ouvertes', 'ordres ouverts',
+  // EN (au cas où)
+  'main orders', 'primary orders', 'open orders', 'open positions'
+];
+async function clickOpenTabAnyFrame(page){
   const frames = page.frames();
-  const xps = [
-    '//button[contains(., "Positions ouvertes")]',
-    '//a[contains(., "Positions ouvertes")]',
-    '//div[contains(@role,"tab") and (contains(., "Positions ouvertes") or contains(., "Open positions"))]',
-    '//button[contains(., "Open position") or contains(., "Open positions")]',
-    '//*[self::a or self::button or self::div][contains(translate(normalize-space(.),"OPENPOSITIONSOUVERTES","openpositionsouvertes"), "positions ouvertes") or contains(translate(normalize-space(.),"OPENPOSITIONS","openpositions"), "open positions")]'
-  ];
   for (const f of frames){
     try{
-      for (const xp of xps){
-        const [el] = await f.$x(xp);
-        if (el){
-          await el.click({delay:20});
-          await sleep(500);
-          return true;
+      const tabs = await listTabsInFrame(f);
+      for (const t of tabs){
+        const low = t.text.toLowerCase();
+        if (OPEN_TAB_LABELS.some(lbl => low.includes(lbl))){
+          // essaie un XPath “texte contient”, sinon le sélecteur d’origine
+          const [byText] = await f.$x(`//*[self::a or self::button or self::div or self::span][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), "${low}")]`);
+          const handle = byText || await f.$(t.selector);
+          if (handle){
+            await handle.click({ delay: 25 });
+            await sleep(900);
+            return { ok:true, frame:f.url(), label:t.text };
+          }
         }
       }
     }catch{}
   }
-  return false;
+  return { ok:false };
 }
 
-// --- parse dans UN frame ---
+// --- brute-force: clique quelques onglets successivement jusqu’à voir une table ---
+async function bruteForceTabsUntilTable(page, maxClicks=8){
+  const frames = page.frames();
+  for (const f of frames){
+    try{
+      const tabs = await listTabsInFrame(f);
+      const sorted = tabs.sort((a,b)=>{
+        const aw = OPEN_TAB_LABELS.some(lbl=>a.text.toLowerCase().includes(lbl)) ? -1 : 0;
+        const bw = OPEN_TAB_LABELS.some(lbl=>b.text.toLowerCase().includes(lbl)) ? -1 : 0;
+        return aw - bw;
+      }).slice(0, maxClicks);
+      for (const t of sorted){
+        const [byText] = await f.$x(`//*[self::a or self::button or self::div or self::span][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), "${t.text.toLowerCase()}")]`);
+        const handle = byText || await f.$(t.selector);
+        if (!handle) continue;
+        await handle.click({ delay: 25 });
+        await sleep(900);
+        const okHere = await f.$(SEL.row);
+        if (okHere) return { ok:true, clicked:t.text, frame:f.url() };
+      }
+    }catch{}
+  }
+  return { ok:false };
+}
+
+// --- parse table d’un frame ---
 async function parseOrdersInFrame(frame){
   return await safeEval(() => frame.evaluate((SEL)=>{
     const text=(el)=>el?(el.innerText||el.textContent||'').trim():'';
@@ -122,6 +183,8 @@ async function parseOrdersInFrame(frame){
     const out=[];
     const rows = document.querySelectorAll(SEL.row);
     rows.forEach(tr=>{
+      // ignore les lignes-titres (th)
+      if (tr.querySelectorAll('th').length) return;
       let id='';
       for (const sel of SEL.orderIdCandidates){
         const el = tr.querySelector(sel);
@@ -146,7 +209,7 @@ async function parseOrdersInFrame(frame){
   }, SEL));
 }
 
-// --- parse dans n'importe quel frame (retourne {items, frameUrl}) ---
+// --- parse dans n'importe quel frame ---
 async function parseVisibleOrders(page){
   const frames = page.frames();
   for (const f of frames){
@@ -158,23 +221,22 @@ async function parseVisibleOrders(page){
   return { items: [], frameUrl: null };
 }
 
-// --- attendre la table dans n'importe quel frame ---
+// --- attend l’apparition d’une table dans n’importe quel frame ---
 async function waitForTableAnyFrame(page, timeoutMs=90000){
   const start = Date.now();
   while(Date.now() - start < timeoutMs){
-    const frames = page.frames();
-    for (const f of frames){
+    for (const f of page.frames()){
       try{
-        const handle = await f.waitForSelector(SEL.row, { timeout: 1000 });
-        if (handle) return true;
+        const found = await f.$(SEL.row);
+        if (found) return true;
       }catch{}
     }
-    await sleep(500);
+    await sleep(350);
   }
   return false;
 }
 
-// ===== Main loop =====
+// ---------- Main loop ----------
 let browser, page, lastReload=0, lastScanAt=0;
 let isNavigating=false; // mutex
 
@@ -185,8 +247,17 @@ async function navigate(url){
   try{
     await page.goto(url,{waitUntil:'domcontentloaded', timeout:120000});
     await tryAcceptConsent(page);
-    await sleep(800);
-    await clickOpenPositionsAnyFrame(page); // activer l’onglet utile si besoin
+    await sleep(700);
+
+    // 1) clique explicite "Ordres principaux" / "Main orders"
+    const clickRes = await clickOpenTabAnyFrame(page);
+    if (clickRes.ok) console.log('Onglet ouvert:', clickRes.label, '| frame:', clickRes.frame);
+    // 2) sinon brute-force
+    if (!clickRes.ok){
+      const bf = await bruteForceTabsUntilTable(page, 10);
+      if (bf.ok) console.log('Table trouvée via brute-force, onglet:', bf.clicked, '| frame:', bf.frame);
+    }
+
     const ok = await waitForTableAnyFrame(page, 90000);
     lastReload = Date.now();
     console.log('Frames:', page.frames().length, '| table any frame:', ok);
@@ -228,23 +299,19 @@ async function ensureBrowser(){
   if (ok) await notifyDiscord('🟢 LBank headless watcher démarré.');
 }
 
-async function reloadSoft(){
-  const ok = await navigate(TRADER_URL);
-  if (!ok) console.warn('reloadSoft: table non trouvée après navigation.');
-}
+async function reloadSoft(){ const ok = await navigate(TRADER_URL); if (!ok) console.warn('reloadSoft: table non trouvée après navigation.'); }
 
 async function scanCycle(){
   try{
     await ensureBrowser();
     if (!page) return;
-
     if (isNavigating) return;
     if (Date.now()-lastReload >= RELOAD_EVERY_MS){ await reloadSoft(); return; }
 
     const { items, frameUrl } = await parseVisibleOrders(page);
     console.log('Rows visibles:', items.length, '| frame:', frameUrl || 'none');
-
     lastScanAt = Date.now();
+
     const visible = new Set(items.map(o=>o.id));
 
     // maj state
@@ -302,11 +369,24 @@ ${st.symbol?`• Symbole: **${st.symbol}**\n`:''}${st.lev?`• Levier: **${st.le
   }
 }
 
-// ===== HTTP (keep-alive + debug) =====
+// ---------- HTTP (keep-alive + debug) ----------
 const app = express();
 app.get('/', (_,res)=>res.send('OK'));
 app.get('/health', (_,res)=>res.json({ ok:true, lastScanAt, lastReload, watching:TRADER_URL }));
-
+app.get('/tabs', async (_,res)=>{
+  try{
+    if (isNavigating) return res.json({ ok:false, navigating:true });
+    await ensureBrowser(); if (!page) return res.json({ ok:false, error:'browser not ready' });
+    const out = [];
+    for (const f of page.frames()){
+      try{
+        const items = await listTabsInFrame(f);
+        if (items.length) out.push({ frame: f.url(), items: items.map(i=>i.text) });
+      }catch{}
+    }
+    res.json({ ok:true, frames: out });
+  }catch(e){ res.json({ ok:false, error:e.message }); }
+});
 app.get('/baseline', async (_,res)=>{
   try{
     if (isNavigating) return res.json({ ok:false, navigating:true });
@@ -321,7 +401,6 @@ app.get('/baseline', async (_,res)=>{
     res.json({ ok:true, baselineAdded: items.length });
   }catch(e){ res.status(500).json({ ok:false, error:e.message }); }
 });
-
 app.get('/count', async (_,res)=>{
   try{
     if (isNavigating) return res.json({ ok:false, navigating:true });
@@ -330,7 +409,6 @@ app.get('/count', async (_,res)=>{
     res.json({ ok:true, rows: items.length });
   }catch(e){ res.json({ ok:false, error:e.message }); }
 });
-
 app.get('/html', async (_,res)=>{
   try{
     if (isNavigating) return res.status(409).send('navigating');
@@ -339,7 +417,6 @@ app.get('/html', async (_,res)=>{
     res.type('text/plain').send(html.slice(0, 20000));
   }catch(e){ res.status(500).send(e.message); }
 });
-
 app.get('/shot', async (_,res)=>{
   try{
     if (isNavigating) return res.status(409).send('navigating');
@@ -348,9 +425,8 @@ app.get('/shot', async (_,res)=>{
     res.type('image/png').send(buf);
   }catch(e){ res.status(500).send(e.message); }
 });
-
 app.listen(PORT, ()=>console.log(`HTTP keep-alive prêt sur : http://localhost:${PORT}/health`));
 
-// ===== START =====
+// ---------- START ----------
 (async () => { try { await scanCycle(); } catch (e) { console.error('first scan error:', e.message); } })();
 setInterval(scanCycle, SCAN_EVERY_MS);
